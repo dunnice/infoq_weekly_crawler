@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+*.log.*
+
+# Selenium / ChromeDriver
+chromedriver
+geckodriver
+*.crx
+
+# Config (保留示例文件，忽略实际配置)
+config.py
+
+# Output directory (if you don't want to commit crawled data)
+# /Users/ice7/Documents/01.curwork/data/obsidian-rep/Infoq/
+
+# Test outputs
+test_*.log
+debug_*.html
+debug_*.png
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
