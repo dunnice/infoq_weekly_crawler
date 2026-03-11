@@ -24,6 +24,16 @@ infoq_weekly_crawler/
 ├── infoq_crawler.py      # 主爬虫脚本
 ├── config.py             # 配置文件
 ├── setup_scheduler.py    # 定时任务配置工具
+├── tools/                # 调试/测试过程脚本
+│   ├── debug_crawler.py
+│   ├── analyze_page.py
+│   └── check_progress.sh
+├── tests/                # 测试代码与测试数据
+│   ├── test_crawler.py
+│   ├── test_image_order.py
+│   ├── test_dom_order.py
+│   ├── test_save_articles.py
+│   └── data/             # 测试数据（快照/截图/分析结果等）
 ├── requirements.txt      # Python 依赖
 ├── run_crawler.sh        # Shell 包装脚本（自动生成）
 ├── infoq_crawler.log     # 运行日志
@@ -55,7 +65,7 @@ pip install -r requirements.txt
 编辑 `config.py`，设置你的 Obsidian 目录：
 
 ```python
-OUTPUT_DIR = "/path/to/your/obsidian/Infoq"
+OUTPUT_DIR = "/Users/ice7/Documents/obsidian-doc/Infoq"
 ```
 
 ### 4. 手动运行一次
@@ -181,7 +191,7 @@ crontab -e
 
 ```bash
 # 运行测试脚本
-python test_crawler.py
+python tests/test_crawler.py
 ```
 
 这会快速测试爬虫是否能找到周刊列表。
@@ -190,7 +200,7 @@ python test_crawler.py
 
 ```bash
 # 运行调试脚本（会打开浏览器窗口）
-python debug_crawler.py
+python tools/debug_crawler.py
 ```
 
 调试脚本会：
@@ -215,7 +225,7 @@ A: 这是最常见的问题，请按以下步骤排查：
 
 1. **运行调试工具**：
    ```bash
-   python debug_crawler.py
+   python tools/debug_crawler.py
    ```
 
 2. **检查网络连接**：
@@ -283,9 +293,16 @@ infoq_weekly_crawler/
 ├── infoq_crawler.py      # 主爬虫脚本
 ├── config.py             # 配置文件
 ├── setup_scheduler.py    # 定时任务配置工具
-├── test_crawler.py       # 快速测试脚本
-├── debug_crawler.py      # 详细调试脚本
-├── test_save_articles.py # 文章保存测试脚本
+├── tools/                # 调试/测试过程脚本
+│   ├── debug_crawler.py
+│   ├── analyze_page.py
+│   └── check_progress.sh
+├── tests/                # 测试代码与测试数据
+│   ├── test_crawler.py       # 快速测试脚本
+│   ├── test_image_order.py   # 图文顺序测试脚本
+│   ├── test_dom_order.py     # DOM 顺序逻辑验证
+│   ├── test_save_articles.py # 文章保存测试脚本
+│   └── data/                 # 快照/截图/分析结果等测试数据
 ├── requirements.txt      # Python 依赖
 ├── README.md             # 使用说明
 ├── LICENSE               # MIT 许可证

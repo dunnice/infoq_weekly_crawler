@@ -151,8 +151,22 @@ class InfoQWeeklyCrawler:
             filename = f"{url_hash}{ext}"
             
             # 确保周刊目录和附件目录存在
+            # 如果 current_weekly_dir 未设置，使用 output_dir 和 weekly_id 构建路径
             if not self.current_weekly_dir:
-                return None
+                if weekly_id:
+                    # 尝试查找已存在的周刊目录
+                    import glob
+                    weekly_dir_pattern = f"周刊_{weekly_id}_*"
+                    possible_dirs = glob.glob(str(self.output_dir / weekly_dir_pattern))
+                    if possible_dirs:
+                        self.current_weekly_dir = Path(possible_dirs[0])
+                    else:
+                        # 如果找不到，创建一个临时目录（会在 _save_weekly 中正式创建）
+                        # 使用当前日期作为占位符
+                        date_str = datetime.now().strftime('%Y-%m-%d')
+                        self.current_weekly_dir = self.output_dir / f"周刊_{weekly_id}_{date_str}"
+                else:
+                    return None
             
             attachments_dir = self.current_weekly_dir / self.image_dir
             attachments_dir.mkdir(parents=True, exist_ok=True)
@@ -845,117 +859,215 @@ class InfoQWeeklyCrawler:
         """
         if not article_url:
             return None
+        
+        # 确保 WebDriver 已初始化
+        if self.driver is None:
+            self._init_driver()
             
         try:
             self.driver.get(article_url)
-            time.sleep(2)  # 减少等待时间
+            time.sleep(3)  # 等待页面初始加载
             
-            # 等待内容加载
+            # 等待内容区域加载完成
             try:
-                WebDriverWait(self.driver, 10).until(  # 减少超时时间
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                # 等待 article-content-layout 元素出现
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "article-content-layout"))
                 )
+                # 额外等待一下，确保内容完全渲染
+                time.sleep(2)
             except TimeoutException:
-                logger.warning(f"页面加载超时: {article_url}")
-                return None
+                # 如果找不到 article-content-layout，尝试等待 body
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.TAG_NAME, "body"))
+                    )
+                    time.sleep(2)
+                except TimeoutException:
+                    logger.warning(f"页面加载超时: {article_url}")
+                    return None
             
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             
-            # 移除不需要的元素
-            self._remove_unwanted_elements(soup)
+            # 调试：保存页面快照（仅在调试时使用）
+            if logger.level <= logging.DEBUG:
+                debug_file = self.output_dir / f"debug_article_{weekly_id}.html"
+                with open(debug_file, 'w', encoding='utf-8') as f:
+                    f.write(self.driver.page_source)
+                logger.debug(f"页面快照已保存: {debug_file}")
             
-            # 提取标题
+            # 先提取标题和内容区域，再移除不需要的元素（避免误删）
+            # 提取标题 - 优先使用 h1.article-title
             title = ""
-            title_selectors = ['h1', '.title', '.article-title', 'article h1']
+            title_selectors = [
+                'h1.article-title',  # 最精确的选择器
+                'h1',
+                '.article-title',
+                '.title',
+                'article h1'
+            ]
             for selector in title_selectors:
-                if selector.startswith('.'):
-                    title_elem = soup.find(class_=selector.lstrip('.'))
-                elif ' ' in selector:
-                    parts = selector.split(' ')
-                    title_elem = soup.find(parts[0], class_=parts[1].lstrip('.')) if len(parts) > 1 else soup.find(parts[0])
-                else:
-                    title_elem = soup.find(selector)
-                if title_elem:
-                    title = title_elem.get_text(strip=True)
-                    break
+                try:
+                    if ' ' in selector:
+                        # 处理复合选择器，如 'h1.article-title'
+                        parts = selector.split('.')
+                        if len(parts) == 2:
+                            tag = parts[0]
+                            class_name = parts[1]
+                            title_elem = soup.find(tag, class_=class_name)
+                        else:
+                            parts = selector.split(' ')
+                            title_elem = soup.find(parts[0], class_=parts[1].lstrip('.')) if len(parts) > 1 else soup.find(parts[0])
+                    elif selector.startswith('.'):
+                        title_elem = soup.find(class_=selector.lstrip('.'))
+                    else:
+                        title_elem = soup.find(selector)
+                    if title_elem:
+                        title = title_elem.get_text(strip=True)
+                        if title and len(title) > 10:  # 确保标题有效
+                            break
+                except Exception as e:
+                    logger.debug(f"标题选择器 {selector} 失败: {e}")
+                    continue
             
-            # 查找正文内容区域 - 尝试多种选择器
+            # 查找正文内容区域 - 根据实际页面结构优化选择器顺序
             content_area = None
             content_selectors = [
+                '.article-content-wrap',        # InfoQ 文章正文区域（最精确，在 article-main 内）
+                '.content-main .article-main .article-content-wrap',  # 完整路径
+                '.article-content-layout .article-content-wrap',      # 备选路径
+                '.content-main .article-main',  # InfoQ 文章主区域
+                '.article-content-layout .article-main',  # 备选组合选择器
+                '.article-main',                # 直接查找 article-main
+                '.content-main',                # InfoQ 内容主区域
+                '.article-content-layout',      # InfoQ 外层容器
+                '.article-content',             # 备选
                 'article',
-                '.article-content',
-                '.content',
                 '.article-body',
+                '.content',
                 '.post-content',
                 'main',
-                '.main-content'
+                '.main-content',
+                '#article-content',
+                '.article-detail',
+                '.article-text',
+                '[class*="article-content"]',   # 更精确的属性选择器
+                '[class*="article"]',
+                '[class*="content"]',
+                '[id*="article"]',
+                '[id*="content"]'
             ]
             
             for selector in content_selectors:
-                if selector.startswith('.'):
-                    content_area = soup.find(class_=selector.lstrip('.'))
-                else:
-                    content_area = soup.find(selector)
-                if content_area:
-                    # 进一步清理：移除内容区域内的广告、评论等
-                    for unwanted in content_area.find_all(class_=lambda x: x and any(
-                        kw in str(x).lower() for kw in ['ad', 'comment', 'share', 'sidebar', 'related']
-                    )):
-                        unwanted.decompose()
-                    break
+                try:
+                    if ' ' in selector:
+                        # 处理组合选择器，如 '.article-content-layout .content-main'
+                        parts = selector.split(' ')
+                        parent_selector = parts[0]
+                        child_selector = parts[1]
+                        
+                        # 查找父元素
+                        if parent_selector.startswith('.'):
+                            parent = soup.find(class_=parent_selector.lstrip('.'))
+                        else:
+                            parent = soup.find(parent_selector)
+                        
+                        if parent:
+                            # 在父元素内查找子元素
+                            if child_selector.startswith('.'):
+                                content_area = parent.find(class_=child_selector.lstrip('.'))
+                            else:
+                                content_area = parent.find(child_selector)
+                    elif selector.startswith('.'):
+                        # 精确匹配类名
+                        class_name = selector.lstrip('.')
+                        # 先尝试精确匹配（BeautifulSoup 的 class_ 参数支持字符串或列表）
+                        content_area = soup.find(class_=class_name)
+                        # 如果失败，尝试部分匹配（类名在 class 列表中）
+                        if not content_area:
+                            content_area = soup.find(class_=lambda x: x and (class_name in x if isinstance(x, list) else class_name in str(x)))
+                        # 如果还是失败，尝试字符串匹配
+                        if not content_area:
+                            content_area = soup.find(class_=lambda x: x and class_name in str(x))
+                    elif selector.startswith('#'):
+                        content_area = soup.find(id=selector.lstrip('#'))
+                    elif selector.startswith('['):
+                        # 属性选择器
+                        if 'class*=' in selector:
+                            class_name = selector.split('class*="')[1].split('"')[0]
+                            content_area = soup.find(class_=lambda x: x and class_name in str(x))
+                        elif 'id*=' in selector:
+                            id_name = selector.split('id*="')[1].split('"')[0]
+                            content_area = soup.find(id=lambda x: x and id_name in str(x))
+                    else:
+                        content_area = soup.find(selector)
+                    
+                    if content_area:
+                        # 进一步清理：移除内容区域内的广告、评论等
+                        for unwanted in content_area.find_all(class_=lambda x: x and any(
+                            kw in str(x).lower() for kw in ['ad', 'comment', 'share', 'sidebar', 'related', 'nav', 'footer', 'header', 'recommend', 'hot']
+                        )):
+                            unwanted.decompose()
+                        # 检查内容区域是否有实际内容
+                        text_content = content_area.get_text(strip=True)
+                        # 验证内容是否包含文章特征（中文标点、段落等）
+                        has_chinese_content = any(char in text_content for char in ['。', '，', '的', '是', '在', '了'])
+                        if len(text_content) > 500 and has_chinese_content:  # 至少要有500个字符且包含中文
+                            logger.debug(f"找到内容区域，使用选择器: {selector}, 内容长度: {len(text_content)}")
+                            break
+                        else:
+                            content_area = None
+                except Exception as e:
+                    logger.debug(f"选择器 {selector} 失败: {e}")
+                    continue
             
             if not content_area:
-                logger.warning(f"未找到内容区域: {article_url}")
-                return None
+                # 如果还是找不到，尝试查找包含大量文本的 div
+                logger.warning(f"未找到内容区域，尝试备用方案: {article_url}")
+                all_divs = soup.find_all('div')
+                for div in all_divs:
+                    text = div.get_text(strip=True)
+                    # 查找包含大量文本的 div（可能是正文）
+                    if len(text) > 500 and div.find('p'):  # 至少500字符且包含段落
+                        # 检查是否包含明显的正文特征
+                        if any(kw in text for kw in ['。', '，', '的', '是', '在']):  # 中文特征
+                            content_area = div
+                            logger.debug(f"使用备用方案找到内容区域，文本长度: {len(text)}")
+                            break
+                
+                if not content_area:
+                    logger.warning(f"完全未找到内容区域: {article_url}")
+                    return None
+            
+            # 在找到内容区域后，清理内容区域内的不需要元素（而不是整个页面）
+            if content_area:
+                # 移除内容区域内的广告、评论等
+                for unwanted in content_area.find_all(class_=lambda x: x and any(
+                    kw in str(x).lower() for kw in ['ad', 'comment', 'share', 'sidebar', 'related', 'nav', 'footer', 'header', 'recommend', 'hot']
+                )):
+                    unwanted.decompose()
             
             # 提取段落和结构化内容，同时处理图片嵌入
+            # 使用递归遍历保持原文的图文顺序
             paragraphs = []
             images = []
             processed_images = set()  # 记录已处理的图片URL，避免重复
+            processed_elements = set()  # 记录已处理的元素，避免重复
             
-            # 方法：按DOM顺序遍历所有元素，文本和图片交替处理
-            # 先找到所有需要处理的元素（文本元素和图片）
-            all_elements = []
-            
-            # 收集所有文本元素
-            for elem in content_area.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'ul', 'ol', 'li', 'blockquote']):
-                all_elements.append(('text', elem))
-            
-            # 收集所有图片元素
-            for img in content_area.find_all('img'):
-                all_elements.append(('img', img))
-            
-            # 按在DOM中的位置排序（使用元素的sourceline或位置）
-            try:
-                all_elements.sort(key=lambda x: x[1].sourceline if hasattr(x[1], 'sourceline') else 0)
-            except:
-                pass  # 如果无法排序，保持原顺序
-            
-            # 处理每个元素
-            for elem_type, elem in all_elements:
-                if elem_type == 'img':
-                    img_src = elem.get('src') or elem.get('data-src') or elem.get('data-original')
-                    if img_src and not img_src.startswith('data:') and img_src not in processed_images:
-                        local_path = self._download_image(img_src, weekly_id)
-                        if local_path:
-                            alt = elem.get('alt', '') or elem.get('title', '') or '图片'
-                            images.append({
-                                'original': img_src,
-                                'local': local_path,
-                                'alt': alt
-                            })
-                            processed_images.add(img_src)
-                            paragraphs.append(f"\n![[{local_path}|{alt}]]\n")
+            def process_element(element, depth=0):
+                """递归处理元素，保持DOM顺序"""
+                if element in processed_elements:
+                    return
+                processed_elements.add(element)
                 
-                elif elem_type == 'text':
-                    # 检查元素内是否有图片（先处理图片）
-                    elem_imgs = elem.find_all('img')
-                    for img in elem_imgs:
-                        img_src = img.get('src') or img.get('data-src') or img.get('data-original')
+                # 如果是图片元素
+                if element.name == 'img':
+                    try:
+                        img_src = element.get('src') or element.get('data-src') or element.get('data-original')
                         if img_src and not img_src.startswith('data:') and img_src not in processed_images:
                             local_path = self._download_image(img_src, weekly_id)
                             if local_path:
-                                alt = img.get('alt', '') or img.get('title', '') or '图片'
+                                alt = element.get('alt', '') or element.get('title', '') or '图片'
                                 images.append({
                                     'original': img_src,
                                     'local': local_path,
@@ -963,9 +1075,21 @@ class InfoQWeeklyCrawler:
                                 })
                                 processed_images.add(img_src)
                                 paragraphs.append(f"\n![[{local_path}|{alt}]]\n")
+                    except Exception as e:
+                        logger.debug(f"处理图片元素失败: {e}")
+                    return
+                
+                # 如果是文本元素（段落、标题等）
+                if element.name in ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'blockquote', 'li']:
+                    # 先处理子元素（包括图片）
+                    if hasattr(element, 'children'):
+                        for child in element.children:
+                            if hasattr(child, 'name'):
+                                if child.name == 'img':
+                                    process_element(child, depth + 1)
                     
                     # 提取文本（移除图片）
-                    elem_copy = BeautifulSoup(str(elem), 'html.parser')
+                    elem_copy = BeautifulSoup(str(element), 'html.parser')
                     for img in elem_copy.find_all('img'):
                         img.decompose()
                     text = elem_copy.get_text(strip=True)
@@ -974,25 +1098,42 @@ class InfoQWeeklyCrawler:
                         # 跳过明显是导航或无关的内容
                         if any(kw in text.lower() for kw in ['首页', '登录', '注册', '订阅', '关注', '分享', '评论']):
                             if len(text) < 20:
-                                continue
+                                return
                         
-                        if elem.name == 'p':
+                        if element.name == 'p':
                             paragraphs.append(text)
-                        elif elem.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                            level = int(elem.name[1])
+                        elif element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                            level = int(element.name[1])
                             paragraphs.append(f"\n{'#' * level} {text}\n")
-                        elif elem.name in ['pre', 'code']:
-                            code = elem.get_text()
+                        elif element.name in ['pre', 'code']:
+                            code = element.get_text() if hasattr(element, 'get_text') else text
                             if code and len(code) > 10:
                                 paragraphs.append(f"\n```\n{code}\n```\n")
-                        elif elem.name == 'blockquote':
+                        elif element.name == 'blockquote':
                             paragraphs.append(f"> {text}")
-                        elif elem.name == 'li':
-                            parent = elem.find_parent(['ul', 'ol'])
-                            if parent and parent.name == 'ul':
+                        elif element.name == 'li':
+                            parent = element.find_parent(['ul', 'ol']) if hasattr(element, 'find_parent') else None
+                            if parent and hasattr(parent, 'name') and parent.name == 'ul':
                                 paragraphs.append(f"- {text}")
-                            elif parent and parent.name == 'ol':
+                            elif parent and hasattr(parent, 'name') and parent.name == 'ol':
                                 paragraphs.append(f"1. {text}")
+                    return
+                
+                # 如果是容器元素（div, section, article等），递归处理子元素
+                if element.name in ['div', 'section', 'article', 'main', 'ul', 'ol']:
+                    if hasattr(element, 'children'):
+                        for child in element.children:
+                            if hasattr(child, 'name'):
+                                process_element(child, depth + 1)
+            
+            # 从内容区域开始递归处理
+            try:
+                if hasattr(content_area, 'children'):
+                    for child in content_area.children:
+                        if hasattr(child, 'name'):
+                            process_element(child)
+            except Exception as e:
+                logger.debug(f"递归处理元素失败: {e}")
             
             # 提取作者
             author = ""
@@ -1025,7 +1166,10 @@ class InfoQWeeklyCrawler:
             }
             
         except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
             logger.warning(f"获取文章详情失败 {article_url}: {e}")
+            logger.error(f"详细错误追踪:\n{error_detail}")
             return None
     
     def _convert_to_markdown(self, weekly_data: Dict) -> str:
@@ -1593,8 +1737,13 @@ class InfoQWeeklyCrawler:
 
 def main():
     """主入口"""
-    # 配置
-    OUTPUT_DIR = "/Users/ice7/Documents/01.curwork/data/obsidian-rep/Infoq"
+    # 从配置文件导入配置
+    try:
+        import config
+        OUTPUT_DIR = config.OUTPUT_DIR
+    except ImportError:
+        # 如果没有配置文件，使用默认值
+        OUTPUT_DIR = "/Users/ice7/Documents/01.curwork/doc/obsidian-rep/Infoq"
     
     # 创建爬虫实例并运行
     crawler = InfoQWeeklyCrawler(output_dir=OUTPUT_DIR)

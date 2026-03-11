@@ -55,6 +55,10 @@ test_*.log
 debug_*.html
 debug_*.png
 
+# Test data / artifacts (snapshots, screenshots, analysis outputs)
+tests/data/
+tests/output/
+
 # macOS
 .DS_Store
 .AppleDouble
