@@ -67,6 +67,10 @@ class InfoQWeeklyCrawler:
         # 记录已处理的周刊，避免重复
         self.processed_file = self.output_dir / ".processed_weekly.json"
         self.processed_weekly = self._load_processed()
+
+        # 记录已处理的文章 URL，避免重复抓取（跨期/同一期重复出现都跳过）
+        self.processed_articles_file = self.output_dir / ".processed_articles.json"
+        self.processed_articles = self._load_processed_articles()
         
         # 确保目录存在
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -91,6 +95,48 @@ class InfoQWeeklyCrawler:
                 json.dump(list(self.processed_weekly), f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存已处理记录失败: {e}")
+
+    def _load_processed_articles(self) -> Dict[str, set]:
+        """加载已处理的文章 URL 记录：{issue_id: set(url)}"""
+        if self.processed_articles_file.exists():
+            try:
+                with open(self.processed_articles_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f) or {}
+                return {str(k): set(v or []) for k, v in raw.items()}
+            except Exception as e:
+                logger.warning(f"加载已处理文章记录失败: {e}")
+        return {}
+
+    def _save_processed_articles(self):
+        """保存已处理的文章 URL 记录"""
+        try:
+            data = {k: sorted(list(v)) for k, v in self.processed_articles.items()}
+            with open(self.processed_articles_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存已处理文章记录失败: {e}")
+
+    def _discover_local_edm_issues(self) -> Dict[str, Path]:
+        """
+        自动识别当前目录下可用的“每周精要 No.xxx*.html”文件。
+        返回 {issue_id: html_path}，同一期多份时取最新修改时间的那份。
+        """
+        base = Path(__file__).parent
+        mapping: Dict[str, Path] = {}
+        for p in base.glob("InfoQ*No.*.html"):
+            m = re.search(r"No\\.(\\d+)", p.name)
+            if not m:
+                continue
+            issue = m.group(1)
+            if issue not in mapping:
+                mapping[issue] = p
+            else:
+                try:
+                    if p.stat().st_mtime > mapping[issue].stat().st_mtime:
+                        mapping[issue] = p
+                except Exception:
+                    mapping[issue] = p
+        return mapping
     
     def _init_driver(self):
         """初始化 Selenium WebDriver"""
@@ -119,7 +165,55 @@ class InfoQWeeklyCrawler:
         if self.driver:
             self.driver.quit()
             self.driver = None
-            
+
+    def _get_weekly_dir_path(self, weekly_info: Dict) -> Path:
+        """根据周刊信息计算本期周刊目录路径（与 _save_weekly 一致）"""
+        info = weekly_info
+        date_str = info.get('date', datetime.now().strftime('%Y-%m-%d'))
+        date_clean = re.sub(r'[^\d-]', '', date_str)[:10]
+        if not date_clean:
+            date_clean = datetime.now().strftime('%Y-%m-%d')
+        weekly_dir_name = f"周刊_{info['id']}_{date_clean}"
+        return self.output_dir / weekly_dir_name
+
+    def _prepare_weekly_dir(self, weekly_info: Dict, clean: bool = False, clean_attachments: bool = False) -> Path:
+        """
+        在抓取内容前先创建本期周刊目录与附件目录，并设为当前目标。
+        后续图片下载与保存都使用该目录。
+        """
+        weekly_dir = self._get_weekly_dir_path(weekly_info)
+        weekly_dir.mkdir(parents=True, exist_ok=True)
+        attachments_dir = weekly_dir / self.image_dir
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        if clean:
+            # 清理旧的索引/文章，避免“重抓”后残留上一轮的 md 文件导致目录与索引不一致
+            for p in weekly_dir.glob("00-index.md"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            for p in weekly_dir.glob("[0-9][0-9]-*.md"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            # 可选：清理调试快照（避免误以为还是旧页面）
+            for p in weekly_dir.glob("debug_weekly_page.html"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            if clean_attachments:
+                for p in attachments_dir.glob("*"):
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                    except Exception:
+                        pass
+        self.current_weekly_dir = weekly_dir
+        logger.info(f"本期周刊目录已就绪: {weekly_dir}")
+        return weekly_dir
+
     def _download_image(self, img_url: str, weekly_id: str) -> Optional[str]:
         """
         下载图片到本地
@@ -145,29 +239,16 @@ class InfoQWeeklyCrawler:
             elif img_url.startswith('/'):
                 img_url = urljoin(self.BASE_URL, img_url)
             
+            # 必须先通过 _prepare_weekly_dir 设定目标目录，附件统一落在该期周刊目录下
+            if not self.current_weekly_dir:
+                logger.warning("未设置本期周刊目录，跳过图片下载（请先调用 _prepare_weekly_dir）")
+                return None
+
             # 生成文件名
             url_hash = hashlib.md5(img_url.encode()).hexdigest()[:8]
             ext = self._get_image_extension(img_url)
             filename = f"{url_hash}{ext}"
-            
-            # 确保周刊目录和附件目录存在
-            # 如果 current_weekly_dir 未设置，使用 output_dir 和 weekly_id 构建路径
-            if not self.current_weekly_dir:
-                if weekly_id:
-                    # 尝试查找已存在的周刊目录
-                    import glob
-                    weekly_dir_pattern = f"周刊_{weekly_id}_*"
-                    possible_dirs = glob.glob(str(self.output_dir / weekly_dir_pattern))
-                    if possible_dirs:
-                        self.current_weekly_dir = Path(possible_dirs[0])
-                    else:
-                        # 如果找不到，创建一个临时目录（会在 _save_weekly 中正式创建）
-                        # 使用当前日期作为占位符
-                        date_str = datetime.now().strftime('%Y-%m-%d')
-                        self.current_weekly_dir = self.output_dir / f"周刊_{weekly_id}_{date_str}"
-                else:
-                    return None
-            
+
             attachments_dir = self.current_weekly_dir / self.image_dir
             attachments_dir.mkdir(parents=True, exist_ok=True)
             
@@ -572,6 +653,47 @@ class InfoQWeeklyCrawler:
             self._scroll_to_load(scroll_times=5, wait_time=2)
             
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+
+            def _get_featured_from_local_edm(issue_id: str) -> List[Dict]:
+                """
+                从本地保存的“InfoQ 每周精要 No.xxx.html”中提取精选文章链接。
+                该 HTML 是你浏览器里看到的“每周精选/每周精要”落地页内容，能稳定拿到约 20 条精选。
+                """
+                try:
+                    mapping = self._discover_local_edm_issues()
+                    html_path = mapping.get(str(issue_id))
+                    if not html_path:
+                        return []
+                    html = html_path.read_text(encoding="utf-8", errors="ignore")
+                    s = BeautifulSoup(html, "html.parser")
+                    links = []
+                    for a in s.find_all("a", href=True):
+                        href = a.get("href", "")
+                        h = href.lower()
+                        if (
+                            "infoq.cn/article/" in h
+                            or "xie.infoq.cn/article/" in h
+                            or "infoq.cn/news/" in h
+                        ):
+                            title = a.get_text(" ", strip=True)[:200]
+                            if title and len(title) > 3:
+                                links.append({"url": href, "title": title})
+
+                    # 去重
+                    seen = set()
+                    uniq = []
+                    for it in links:
+                        if it["url"] in seen:
+                            continue
+                        seen.add(it["url"])
+                        uniq.append(it)
+
+                    if uniq:
+                        logger.info(f"使用本地每周精要HTML提取精选链接: {html_path.name}（{len(uniq)} 条）")
+                    return uniq
+                except Exception as e:
+                    logger.warning(f"解析本地每周精要HTML失败: {e}")
+                    return []
             
             # 保存页面快照用于调试
             if self.current_weekly_dir:
@@ -582,57 +704,109 @@ class InfoQWeeklyCrawler:
             
             # 先提取文章链接（在移除不需要的元素之前）
             article_links = []
-            
-            # 方法1: 查找带有 com-article-title class 的链接（InfoQ 的标准文章标题链接）
-            article_title_links = soup.find_all('a', class_='com-article-title')
-            for link in article_title_links:
-                href = link.get('href', '')
-                if href:
+
+            # 如果 Selenium 打到的是首页 SPA（常见：/weekly/{id} 被风控导回首页），
+            # 则优先使用本地保存的“每周精要 No.xxx.html”来提取精选列表。
+            issue_id = str(weekly_info.get("id", "")).strip()
+            if issue_id:
+                current_url = getattr(self.driver, "current_url", "") or ""
+                if f"/weekly/{issue_id}" not in current_url:
+                    local_featured = _get_featured_from_local_edm(issue_id)
+                    if local_featured:
+                        article_links = local_featured
+
+            def _is_featured_href(href: str) -> bool:
+                """只保留周刊精选列表里的文章/资讯链接，过滤视频/专题/小册等。"""
+                if not href:
+                    return False
+                h = href.lower()
+                # 排除
+                if any(p in h for p in ['/video/', '/theme/', '/minibook/', 'utm_source=home_video', 'space/', '/weekly/landing']):
+                    return False
+                # 允许：InfoQ 文章/资讯、写作平台文章
+                return (
+                    '/article/' in h
+                    or '/news/' in h
+                    or 'xie.infoq.cn/article/' in h
+                    or 'infoq.cn/article/' in h
+                    or 'infoq.cn/news/' in h
+                )
+
+            def _pick_featured_container(root: BeautifulSoup):
+                """
+                只抓取“精选列表容器”。
+                优先选择更具体的列表区块（article-list-section/article-list/list），
+                找不到则回退到 main。
+                """
+                selectors = [
+                    ('div', {'class': lambda x: x and 'article-list-section' in str(x)}),
+                    ('div', {'class': lambda x: x and 'article-list' in str(x)}),
+                    ('div', {'class': lambda x: x and 'recommond-section' in str(x)}),
+                    ('div', {'class': lambda x: x and 'list' == str(x)}),
+                    ('div', {'class': lambda x: x and 'main' == str(x)}),
+                    ('main', {}),
+                ]
+                best = None
+                best_score = -1
+                for name, kwargs in selectors:
+                    for node in root.find_all(name, **kwargs) if kwargs else root.find_all(name):
+                        links = node.find_all('a', href=True)
+                        good = [a for a in links if _is_featured_href(a.get('href', ''))]
+                        score = len(good)
+                        if score > best_score:
+                            best_score = score
+                            best = node
+                return best
+
+            # 若已从本地HTML拿到精选链接，就不再从页面容器提取
+            if not article_links:
+                featured_root = _pick_featured_container(soup) or soup
+                logger.info(
+                    f"精选容器提取: tag={getattr(featured_root, 'name', 'unknown')} links={len(featured_root.find_all('a', href=True))}"
+                )
+
+                # 只在精选容器内提取文章链接
+                # 方法1：容器内 com-article-title
+                for link in featured_root.find_all('a', class_='com-article-title', href=True):
+                    href = link.get('href', '')
+                    if not _is_featured_href(href):
+                        continue
                     full_url = urljoin(self.BASE_URL, href) if not href.startswith('http') else href
                     title = link.get_text(strip=True)
                     if title and len(title) > 5:
-                        article_links.append({
-                            'url': full_url,
-                            'title': title[:200]
-                        })
-            
-            # 方法2: 查找 article-item 容器中的链接
-            article_items = soup.find_all(class_='article-item')
-            for item in article_items:
-                link = item.find('a', href=True)
-                if link:
+                        article_links.append({'url': full_url, 'title': title[:200]})
+
+                # 方法2：容器内 article-item
+                for item in featured_root.find_all(class_='article-item'):
+                    link = item.find('a', href=True)
+                    if not link:
+                        continue
                     href = link.get('href', '')
-                    if '/article/' in href or 'infoq.cn/article' in href:
-                        full_url = urljoin(self.BASE_URL, href) if not href.startswith('http') else href
-                        # 尝试从多个地方提取标题
+                    if not _is_featured_href(href):
+                        continue
+                    full_url = urljoin(self.BASE_URL, href) if not href.startswith('http') else href
+                    title = link.get_text(strip=True)
+                    if not title or len(title) < 5:
+                        title_elem = item.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', '.title', '.com-article-title'])
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                    if title and len(title) > 5 and not any(a['url'] == full_url for a in article_links):
+                        article_links.append({'url': full_url, 'title': title[:200]})
+
+                # 方法3：兜底，仅在精选容器内扫所有链接（但仍过滤类型）
+                if not article_links:
+                    for link in featured_root.find_all('a', href=True):
+                        href = link.get('href', '')
+                        if not _is_featured_href(href):
+                            continue
                         title = link.get_text(strip=True)
                         if not title or len(title) < 5:
-                            title_elem = item.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', '.title', '.com-article-title'])
-                            if title_elem:
-                                title = title_elem.get_text(strip=True)
-                        
-                        if title and len(title) > 5:
-                            # 检查是否已存在
-                            if not any(a['url'] == full_url for a in article_links):
-                                article_links.append({
-                                    'url': full_url,
-                                    'title': title[:200]
-                                })
-            
-            # 方法3: 查找所有包含 /article/ 的链接
-            if not article_links:
-                all_links = soup.find_all('a', href=True)
-                for link in all_links:
-                    href = link.get('href', '')
-                    if '/article/' in href or 'infoq.cn/article' in href:
+                            continue
+                        if any(kw in title.lower() for kw in ['首页', '登录', '注册', '订阅', '关注', '更多']):
+                            continue
                         full_url = urljoin(self.BASE_URL, href) if not href.startswith('http') else href
-                        title = link.get_text(strip=True)
-                        # 过滤太短的标题和明显不是文章的链接
-                        if title and len(title) > 5 and not any(kw in title.lower() for kw in ['首页', '登录', '注册', '订阅', '关注', '更多']):
-                            article_links.append({
-                                'url': full_url,
-                                'title': title[:200]
-                            })
+                        if not any(a['url'] == full_url for a in article_links):
+                            article_links.append({'url': full_url, 'title': title[:200]})
             
             # 去重
             seen_urls = set()
@@ -651,6 +825,12 @@ class InfoQWeeklyCrawler:
             for i, article_link in enumerate(unique_articles, 1):
                 try:
                     logger.info(f"正在获取文章 {i}/{len(unique_articles)}: {article_link['title'][:50]}")
+                    # 按 URL 去重：已抓过的文章直接跳过，避免重复爬取
+                    issue_id = str(weekly_info.get("id", ""))
+                    url = article_link.get("url", "")
+                    if issue_id and url and url in self.processed_articles.get(issue_id, set()):
+                        logger.info(f"跳过已抓取文章: {url}")
+                        continue
                     article_detail = self._get_article_detail(article_link['url'], weekly_info['id'])
                     if article_detail:
                         # 优先使用列表页的标题，如果详情页有标题且列表页标题太短，则使用详情页标题
@@ -669,6 +849,10 @@ class InfoQWeeklyCrawler:
                             article_detail['title'] = f"文章{i}"
                         
                         articles.append(article_detail)
+                        # 记录已抓取
+                        if issue_id and url:
+                            self.processed_articles.setdefault(issue_id, set()).add(url)
+                            self._save_processed_articles()
                     else:
                         # 即使获取详情失败，也保存基本信息
                         articles.append({
@@ -727,7 +911,62 @@ class InfoQWeeklyCrawler:
         for tag in unwanted_tags:
             for elem in soup.find_all(tag):
                 elem.decompose()
-    
+
+    # 文章末尾广告识别：class 关键词与正文尾部文案关键词
+    _AD_CLASS_KEYWORDS = [
+        'ad', 'ads', 'advert', 'advertisement', 'promo', 'sponsor', 'recommend',
+        'related', 'hot', 'share', 'qrcode', 'follow', 'course', 'buy', 'banner',
+        '推广', '广告', '推荐阅读', '延伸阅读', '你可能还喜欢'
+    ]
+    _AD_TEXT_KEYWORDS = [
+        '广告', '推广', '赞助', '推荐阅读', '扫码', '关注公众号', '训练营', '课程',
+        '立即购买', '优惠', '更多精彩', '你可能还喜欢', '延伸阅读', '关注我们', '了解更多',
+        '订阅', '报名', '限时', '抢购', '点击领取'
+    ]
+
+    def _remove_article_ads(self, content_area) -> None:
+        """在正文区域内移除广告块（class 或文案像广告的块）"""
+        if not content_area:
+            return
+        # 只处理 Tag 节点（遍历前快照，避免 decompose 后节点失效）
+        for elem in list(content_area.find_all(True)):
+            try:
+                if elem is None or not getattr(elem, 'attrs', None):
+                    continue
+                classes = elem.get('class') or []
+                class_str = ' '.join(classes).lower() if isinstance(classes, list) else str(classes).lower()
+                if any(kw in class_str for kw in self._AD_CLASS_KEYWORDS):
+                    elem.decompose()
+                    continue
+                text = elem.get_text(strip=True) if hasattr(elem, 'get_text') else ''
+                if len(text) < 300 and any(kw in text for kw in self._AD_TEXT_KEYWORDS):
+                    elem.decompose()
+            except Exception:
+                continue
+
+    def _trim_trailing_ads(self, paragraphs: List[str], images: List[Dict]) -> Tuple[List[str], List[Dict]]:
+        """从段落末尾向前裁剪广告文案与广告图，并同步过滤 images 中已不存在的引用。"""
+        if not paragraphs:
+            return paragraphs, images
+        ad_keywords = self._AD_TEXT_KEYWORDS
+        new_paragraphs = list(paragraphs)
+        # 只从尾部连续移除：空行或短句且含广告关键词
+        while new_paragraphs:
+            last = new_paragraphs[-1].strip()
+            if not last:
+                new_paragraphs.pop()
+                continue
+            if len(last) < 250 and any(kw in last for kw in ad_keywords):
+                new_paragraphs.pop()
+                continue
+            break
+        # 收集仍出现在段落中的图片相对路径
+        content_str = '\n'.join(new_paragraphs)
+        kept_paths = set(re.findall(r'!\[\[(attachments/[^\|\]]+)', content_str))
+        # 兼容 local 为 "attachments/xx.jpg" 或 "attachments/xx.jpg|alt"
+        new_images = [img for img in images if (img.get('local') or '').split('|')[0].strip() in kept_paths or (img.get('local') or '').strip() in kept_paths]
+        return new_paragraphs, new_images
+
     def _parse_article(self, element, weekly_id: str) -> Optional[Dict]:
         """解析单篇文章"""
         try:
@@ -1046,6 +1285,8 @@ class InfoQWeeklyCrawler:
                     kw in str(x).lower() for kw in ['ad', 'comment', 'share', 'sidebar', 'related', 'nav', 'footer', 'header', 'recommend', 'hot']
                 )):
                     unwanted.decompose()
+                # 剔除文章内广告块（含广告 class 或广告文案的节点）
+                self._remove_article_ads(content_area)
             
             # 提取段落和结构化内容，同时处理图片嵌入
             # 使用递归遍历保持原文的图文顺序
@@ -1134,6 +1375,9 @@ class InfoQWeeklyCrawler:
                             process_element(child)
             except Exception as e:
                 logger.debug(f"递归处理元素失败: {e}")
+
+            # 剔除文章末尾广告（文案与图片）
+            paragraphs, images = self._trim_trailing_ads(paragraphs, images)
             
             # 提取作者
             author = ""
@@ -1285,21 +1529,10 @@ class InfoQWeeklyCrawler:
         try:
             info = weekly_data['info']
             articles = weekly_data['articles']
-            
-            # 生成周刊目录名
-            date_str = info.get('date', datetime.now().strftime('%Y-%m-%d'))
-            date_clean = re.sub(r'[^\d-]', '', date_str)[:10]
-            if not date_clean:
-                date_clean = datetime.now().strftime('%Y-%m-%d')
-            
-            weekly_dir_name = f"周刊_{info['id']}_{date_clean}"
-            weekly_dir = self.output_dir / weekly_dir_name
+            # 使用与 _prepare_weekly_dir 一致的路径（目录通常已存在）
+            weekly_dir = self._get_weekly_dir_path(info)
             weekly_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 设置当前周刊目录（用于图片下载）
             self.current_weekly_dir = weekly_dir
-            
-            # 创建附件目录
             attachments_dir = weekly_dir / self.image_dir
             attachments_dir.mkdir(parents=True, exist_ok=True)
             
@@ -1520,7 +1753,7 @@ class InfoQWeeklyCrawler:
         lines.append("---")
         lines.append("")
         
-        # 文章列表
+        # 文章列表（使用 Obsidian 双括号链接 [[文件名|标题]] 以便正确跳转）
         if articles:
             lines.append("## 📚 文章列表")
             lines.append("")
@@ -1536,9 +1769,11 @@ class InfoQWeeklyCrawler:
                     else:
                         title = f"文章 {i}"
                 
-                # 生成文章文件名
+                # 生成文章文件名（与 _save_article 完全一致，保证链接目标存在）
                 article_filename = self._generate_article_filename(article, i)
-                lines.append(f"{i}. [{title}]({article_filename})")
+                # 展示用标题中若有 | 或 ]] 会破坏 wiki 链接，做安全替换
+                display = (title[:80].replace('|', '｜').replace(']]', '').replace('\n', ' ').strip() or article_filename)
+                lines.append(f"{i}. [[{article_filename}|{display}]]")
                 if article.get('author'):
                     lines.append(f"   - 作者: {article['author']}")
                 if article.get('url'):
@@ -1682,8 +1917,9 @@ class InfoQWeeklyCrawler:
             for weekly_info in to_crawl:
                 try:
                     logger.info(f"开始爬取: {weekly_info['title']}")
-                    
-                    # 获取周刊内容
+                    # 先确定并创建本期周刊目录，后续下载与保存都使用该目录
+                    self._prepare_weekly_dir(weekly_info)
+                    # 获取周刊内容（图片会下载到上面创建的 attachments 目录）
                     weekly_data = self._get_weekly_content(weekly_info)
                     
                     # 获取每篇文章的详细内容
@@ -1734,20 +1970,83 @@ class InfoQWeeklyCrawler:
         
         return saved_files
 
+    def crawl_issue(self, issue_id: int, force: bool = True) -> Optional[Path]:
+        """
+        爬取指定期号的周刊（如 913 期）。
+        issue_id: 期号
+        force: 是否强制抓取（不检查已处理记录）
+        """
+        weekly_info = {
+            'id': str(issue_id),
+            'title': f'InfoQ周刊第{issue_id}期',
+            'url': f'{self.BASE_URL}/weekly/{issue_id}',
+            'date': datetime.now().strftime('%Y-%m-%d'),
+        }
+        try:
+            self._init_driver()
+            logger.info(f"开始爬取第 {issue_id} 期: {weekly_info['url']}")
+            # 强制重抓时，先清理旧的 md（可选清附件），避免残留上一轮内容
+            self._prepare_weekly_dir(weekly_info, clean=True, clean_attachments=False)
+            weekly_data = self._get_weekly_content(weekly_info)
+            weekly_dir = self._save_weekly(weekly_data)
+            if weekly_dir:
+                if force or str(issue_id) not in self.processed_weekly:
+                    self.processed_weekly.add(str(issue_id))
+                    self._save_processed()
+                logger.info(f"第 {issue_id} 期已保存: {weekly_dir}")
+                return weekly_dir
+        except Exception as e:
+            logger.error(f"爬取第 {issue_id} 期失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            self._close_driver()
+        return None
+
+    def sync_range(self, start_issue: int, end_issue: int, require_local_edm: bool = True) -> List[Path]:
+        """
+        增量同步一个期号范围：自动识别当前可爬的期号（需存在本地 No.xxx HTML 或周刊页可用），
+        对每期按“文章 URL”去重，不重复抓取已爬文章。
+        """
+        saved = []
+        if start_issue > end_issue:
+            start_issue, end_issue = end_issue, start_issue
+
+        local_edm = self._discover_local_edm_issues()
+        for issue in range(start_issue, end_issue + 1):
+            issue_id = str(issue)
+            can_by_edm = issue_id in local_edm
+            if not can_by_edm:
+                # 没有本地 EDM，就尝试直接爬；若被导到首页则会抓不到“精选”，但仍可能抓到一些链接
+                logger.warning(f"第 {issue} 期未发现本地每周精要HTML，可能无法对齐精选列表；如需对齐请提供 No.{issue} 的 HTML")
+                if require_local_edm:
+                    logger.warning(f"已开启 require_local_edm，跳过第 {issue} 期")
+                    continue
+            try:
+                d = self.crawl_issue(issue, force=True)
+                if d:
+                    saved.append(d)
+            except Exception as e:
+                logger.error(f"同步第 {issue} 期失败: {e}")
+                continue
+        return saved
+
 
 def main():
-    """主入口"""
-    # 从配置文件导入配置
+    """主入口。无参数时爬取最新一期；可传期号如 913 爬取指定期。"""
+    import sys
     try:
         import config
         OUTPUT_DIR = config.OUTPUT_DIR
     except ImportError:
-        # 如果没有配置文件，使用默认值
         OUTPUT_DIR = "/Users/ice7/Documents/01.curwork/doc/obsidian-rep/Infoq"
-    
-    # 创建爬虫实例并运行
+
     crawler = InfoQWeeklyCrawler(output_dir=OUTPUT_DIR)
-    crawler.run()
+    if len(sys.argv) >= 2 and sys.argv[1].isdigit():
+        issue_id = int(sys.argv[1])
+        crawler.crawl_issue(issue_id, force=True)
+    else:
+        crawler.run()
 
 
 if __name__ == "__main__":
