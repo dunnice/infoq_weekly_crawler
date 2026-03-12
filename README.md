@@ -7,15 +7,12 @@
 
 ## 功能特性
 
-- 🔄 自动抓取最新 InfoQ 周刊内容
-- 📝 转换为 Obsidian 友好的 Markdown 格式
-- 🖼️ 自动下载图片并使用 Obsidian 附图语法嵌入
-- 🏷️ 自动添加 YAML Front Matter 元数据
-- 📁 智能文件组织：每周一个目录，包含索引和文章
-- 📊 自动分析周刊内容：主题识别、关键词提取、趋势分析
-- ⏰ 支持定时任务自动执行（macOS launchd / Linux cron）
-- 🔍 智能去重，避免重复抓取已处理的周刊
-- 🧹 自动清理网页广告、导航、评论等无关内容
+- 📡 **一次请求拉取多期**：请求周刊列表 API（`Referer: https://www.infoq.cn/weekly/landing`，`Content-Type: application/json`，`payload: {"size":100}`），返回约 100 期周刊，再按周处理。
+- 📁 **按周建目录**：目录名为 `周刊_{周刊number}_{周刊时间转为 yyyy-mm-dd}`，每期下含 `00-index.md`、文章 md 与 `attachments/`。
+- 🔍 **按篇检查是否已下载**：每期文章列表中，先查本地是否已下载（按 URL 记录）；未下载才抓取正文与图片并保存。
+- 📝 转换为 Obsidian 友好 Markdown，索引用双链 `[[文件名|标题]]` 可点击跳转。
+- 🧹 正文内与文末广告自动剔除。
+- ⏰ 支持定时任务（macOS launchd / Linux cron）。API 无数据时可回退到本地「每周精要」HTML 或周刊页解析。
 
 ## 目录结构
 
@@ -68,17 +65,24 @@ pip install -r requirements.txt
 OUTPUT_DIR = "/Users/ice7/Documents/obsidian-doc/Infoq"
 ```
 
-### 4. 手动运行一次
+### 4. 手动运行
 
 ```bash
 # 激活虚拟环境（如果使用）
 source venv/bin/activate
 
-# 运行爬虫
+# 请求 API 获取约 100 期列表，按周建目录，未下载的文章才抓取
 python infoq_crawler.py
+
+# 只同步指定期（会从本地精要 HTML 或周刊页获取文章列表）
+python infoq_crawler.py 914
 ```
 
-### 5. 设置定时任务
+注意：你需要在 `config.py` 里填入真实的 `WEEKLY_LIST_API_URL`。为了避免请求不存在的地址，项目默认不填写该值（为空则不会发起 API 请求）。
+
+若 API 未返回数据或你暂时不配置 API，可将「每周精要」页面另存为 HTML 到项目根目录（文件名含 `InfoQ`、`No.`、期号），程序会据此解析文章列表。
+
+### 6. 设置定时任务
 
 ```bash
 # 安装定时任务（每周一 08:00 自动执行）
