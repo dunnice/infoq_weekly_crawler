@@ -4,7 +4,7 @@
 InfoQ 周刊爬虫
 
 流程说明：
-1. 通过 API 一次请求获取多期周刊列表：POST，Referer=weekly/landing，Content-Type=application/json，payload={"size":100}。
+1. 通过 API 一次请求获取多期周刊列表：先访问 weekly/landing 预热会话，再 POST getPaperList，payload={"size":20}。
 2. 按周处理：目录名为 周刊_{周刊number}_{周刊时间转为 yyyy-mm-dd}。
 3. 每期：获取该期文章列表，检查每篇文章本地是否已下载（按 URL 记录）；未下载则抓取正文与图片并保存。
 4. 入口：无参数 = 拉取 100 期列表并逐期同步；指定期号 = 只同步该期（需能拿到该期文章列表）。
@@ -77,6 +77,8 @@ class InfoQWeeklyCrawler:
     """InfoQ 周刊爬虫：以本地「每周精要」HTML 为文章列表来源，按 URL 去重抓取。"""
 
     BASE_URL = "https://www.infoq.cn"
+    LANDING_URL = "https://www.infoq.cn/weekly/landing"
+    DEFAULT_LIST_API_URL = "https://www.infoq.cn/public/v1/misc/getPaperList"
 
     def __init__(self, output_dir: str, image_dir: str = "attachments", edm_dir: Optional[Path] = None):
         self.output_dir = Path(output_dir)
@@ -93,16 +95,24 @@ class InfoQWeeklyCrawler:
         self.processed_articles = self._load_processed_articles()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.current_weekly_dir: Optional[Path] = None
+        self._landing_primed = False
+        self._request_timeout = 30
+        self._article_request_blocked = False
         # API 配置（与 config 对齐，便于覆盖）
         try:
             import config as _cfg
+            self.image_dir = getattr(_cfg, "IMAGE_DIR", image_dir) or image_dir
             self._api_referer = getattr(_cfg, "WEEKLY_LIST_REFERER", "https://www.infoq.cn/weekly/landing")
-            self._api_url = getattr(_cfg, "WEEKLY_LIST_API_URL", "") or ""
+            self._api_url = getattr(_cfg, "WEEKLY_LIST_API_URL", self.DEFAULT_LIST_API_URL) or self.DEFAULT_LIST_API_URL
             self._api_size = getattr(_cfg, "WEEKLY_LIST_PAYLOAD_SIZE", 100)
+            self._api_max_size = getattr(_cfg, "WEEKLY_LIST_MAX_PAYLOAD_SIZE", 1000)
+            self._request_timeout = getattr(_cfg, "REQUEST_TIMEOUT", 30)
         except ImportError:
             self._api_referer = "https://www.infoq.cn/weekly/landing"
-            self._api_url = ""
+            self._api_url = self.DEFAULT_LIST_API_URL
             self._api_size = 100
+            self._api_max_size = 1000
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_processed_articles(self) -> Dict[str, set]:
         if self.processed_articles_file.exists():
@@ -139,6 +149,63 @@ class InfoQWeeklyCrawler:
                 return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
         return datetime.now().strftime("%Y-%m-%d")
 
+    def _prime_weekly_session(self, force: bool = False) -> bool:
+        """
+        先访问 weekly landing 页，获取 cookie 和基础 header，再复用同一 Session 调用 getPaperList。
+        """
+        if self._landing_primed and not force:
+            return True
+        try:
+            headers = {
+                "Referer": self.LANDING_URL,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            }
+            resp = self.session.get(self.LANDING_URL, headers=headers, timeout=self._request_timeout)
+            resp.raise_for_status()
+            self._landing_primed = True
+            logger.info("已预热 InfoQ landing 会话，cookies=%s", len(self.session.cookies))
+            return True
+        except Exception as e:
+            logger.warning("访问 landing 页失败，将直接尝试调用周刊 API: %s", e)
+            return False
+
+    def _build_weekly_api_headers(self) -> Dict[str, str]:
+        return {
+            "Referer": self._api_referer or self.LANDING_URL,
+            "Origin": self.BASE_URL,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": self.session.headers.get("User-Agent", ""),
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+    def _normalize_weekly_item(self, item: Dict) -> Optional[Dict]:
+        if not isinstance(item, dict):
+            return None
+        wid = item.get("number") or item.get("id") or item.get("weeklyId") or item.get("issueId")
+        if wid is None:
+            return None
+        issue_id = str(wid)
+        ts_sec = item.get("time")
+        date_str = None
+        if isinstance(ts_sec, (int, float)):
+            try:
+                date_str = datetime.fromtimestamp(ts_sec).strftime("%Y-%m-%d")
+            except Exception:
+                date_str = None
+        if not date_str:
+            date_str = self._normalize_week_time_to_date(str(item.get("date") or ""), None)
+        edm_url = item.get("url") or ""
+        if edm_url and not edm_url.startswith("http"):
+            edm_url = urljoin(self.BASE_URL, edm_url)
+        return {
+            "id": issue_id,
+            "date": date_str,
+            "articles": item.get("articles"),
+            "edm_url": edm_url,
+            "timestamp": ts_sec,
+        }
+
     # ---------- 1. API：一次请求获取多期周刊列表 ----------
     def fetch_weekly_list_from_api(self, size: Optional[int] = None) -> List[Dict]:
         """
@@ -150,18 +217,13 @@ class InfoQWeeklyCrawler:
         size = size if size is not None else self._api_size
         url = (self._api_url or "").strip()
         if not url:
-            # 未配置真实接口时，不发请求（避免打到不存在的默认地址）
             return []
-        headers = {
-            "Referer": self._api_referer,
-            "Content-Type": "application/json",
-            "User-Agent": self.session.headers.get("User-Agent", ""),
-            "Accept": "application/json",
-        }
+        self._prime_weekly_session()
+        headers = self._build_weekly_api_headers()
         payload = {"size": size}
         out: List[Dict] = []
         try:
-            resp = self.session.post(url, json=payload, headers=headers, timeout=30)
+            resp = self.session.post(url, json=payload, headers=headers, timeout=self._request_timeout)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -173,31 +235,45 @@ class InfoQWeeklyCrawler:
             logger.warning("周刊列表 API 返回格式异常: 无 data 数组")
             return out
         for item in raw_list:
-            if not isinstance(item, dict):
-                continue
-            # 期号：number（getPaperList）或其他兼容字段
-            wid = item.get("number") or item.get("id") or item.get("weeklyId") or item.get("issueId")
-            if wid is None:
-                continue
-            issue_id = str(wid)
-            # 时间：getPaperList 的 time 为秒级时间戳
-            ts_sec = item.get("time")
-            date_str = None
-            if isinstance(ts_sec, (int, float)):
-                try:
-                    date_str = datetime.fromtimestamp(ts_sec).strftime("%Y-%m-%d")
-                except Exception:
-                    date_str = None
-            if not date_str:
-                date_str = self._normalize_week_time_to_date(None, None)
-            edm_url = item.get("url") or ""
-            if edm_url and not edm_url.startswith("http"):
-                edm_url = urljoin(self.BASE_URL, edm_url)
-            out.append({"id": issue_id, "date": date_str, "articles": None, "edm_url": edm_url})
+            normalized = self._normalize_weekly_item(item)
+            if normalized:
+                out.append(normalized)
         logger.info("从 API(getPaperList) 解析到 %s 期周刊", len(out))
         return out
 
-    LANDING_URL = "https://www.infoq.cn/weekly/landing"
+    def fetch_all_weekly_list_from_api(self) -> List[Dict]:
+        """
+        默认批量模式尽量拉取全部可爬历史。
+        getPaperList 没有 offset 时，采用逐步放大 size 的方式探测接口上限。
+        """
+        tried_sizes = []
+        candidate_sizes = sorted({
+            max(20, self._api_size),
+            100,
+            300,
+            500,
+            self._api_max_size,
+        })
+        best: List[Dict] = []
+        last_count = -1
+        for size in candidate_sizes:
+            if size <= 0 or size in tried_sizes:
+                continue
+            tried_sizes.append(size)
+            weekly_list = self.fetch_weekly_list_from_api(size=size)
+            count = len(weekly_list)
+            if count > len(best):
+                best = weekly_list
+            if count == 0:
+                break
+            if count < size:
+                logger.info("API 在 size=%s 时返回 %s 期，视为已触达可爬历史上限", size, count)
+                return weekly_list
+            if count == last_count and count == len(best):
+                logger.info("API 返回数量在 size=%s 时不再增长，使用当前 %s 期结果", size, count)
+                return best
+            last_count = count
+        return best
 
     def fetch_weekly_list_from_landing_page(self) -> List[Dict]:
         """
@@ -284,7 +360,13 @@ class InfoQWeeklyCrawler:
         # 1) 若 API 提供了 edm_url，则直接在线获取 HTML
         if edm_url:
             try:
-                resp = self.session.get(edm_url, timeout=30)
+                if not self._landing_primed:
+                    self._prime_weekly_session()
+                resp = self.session.get(
+                    edm_url,
+                    headers={"Referer": self.LANDING_URL, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"},
+                    timeout=self._request_timeout,
+                )
                 resp.raise_for_status()
                 # 避免 requests 错误按 ISO-8859-1 解码导致中文标题乱码，优先按 UTF-8 直接解码
                 raw = resp.content
@@ -401,6 +483,7 @@ class InfoQWeeklyCrawler:
             ext = ".png" if ".png" in path_lower else ".gif" if ".gif" in path_lower else ".webp" if ".webp" in path_lower else ".jpg"
             filename = f"{url_hash}{ext}"
             attachments_dir = self.current_weekly_dir / self.image_dir
+            attachments_dir.mkdir(parents=True, exist_ok=True)
             local_path = attachments_dir / filename
             rel = f"{self.image_dir}/{filename}"
             if local_path.exists():
@@ -425,6 +508,14 @@ class InfoQWeeklyCrawler:
         "立即购买", "优惠", "更多精彩", "你可能还喜欢", "延伸阅读", "关注我们", "了解更多",
         "订阅", "报名", "限时", "抢购", "点击领取",
     ]
+    _NOISE_TEXT_KEYWORDS = [
+        "联系我们", "内容投稿", "业务合作", "反馈投诉", "加入我们", "联系电话",
+        "InfoQ 近期会议", "全球 InfoQ", "促进软件开发及相关领域知识与创新的传播",
+    ]
+    _LEADING_CATEGORY_TEXTS = {
+        "企业动态", "行业深度", "ai&大模型", "出海", "后端", "芯片&算力", "架构",
+        "大数据", "软件工程", "云计算", "大前端", "管理/文化",
+    }
 
     def _init_driver(self):
         if self.driver is not None:
@@ -489,161 +580,265 @@ class InfoQWeeklyCrawler:
         ]
         return new_paragraphs, new_images
 
-    def fetch_article_detail(self, article_url: str, weekly_id: str, list_title: str = "") -> Optional[Dict]:
-        """
-        用 Selenium 打开文章详情页，提取标题、正文、图片、作者、时间；
-        正文区域去广告、末尾广告裁剪；图片下载到 current_weekly_dir/attachments/。
-        返回 {"title","content","images","author","publish_time","url"}，失败返回 None。
-        """
-        if not article_url:
+    def _trim_leading_noise(self, paragraphs: List[str]) -> List[str]:
+        if not paragraphs:
+            return paragraphs
+        new_paragraphs = list(paragraphs)
+        while new_paragraphs:
+            first = new_paragraphs[0].strip()
+            normalized = first.lower().strip("-#> ").replace(" ", "")
+            if not first:
+                new_paragraphs.pop(0)
+                continue
+            if normalized in self._LEADING_CATEGORY_TEXTS or "本文字数" in first or "阅读完需" in first:
+                new_paragraphs.pop(0)
+                continue
+            if len(first) <= 12 and not any(p in first for p in ["。", "，", "：", ":", "|"]):
+                new_paragraphs.pop(0)
+                continue
+            break
+        return new_paragraphs
+
+    def _drop_noise_paragraphs(self, paragraphs: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for text in paragraphs:
+            line = (text or "").strip()
+            if not line:
+                continue
+            if len(line) < 200 and any(keyword in line for keyword in self._NOISE_TEXT_KEYWORDS):
+                continue
+            cleaned.append(text)
+        return cleaned
+
+    def _extract_article_meta(self, soup: BeautifulSoup) -> Tuple[str, str, str]:
+        title = ""
+        for sel in ["h1.article-title", "h1", ".article-title"]:
+            try:
+                if " " in sel:
+                    tag, cls = sel.split(".", 1)
+                    el = soup.find(tag, class_=cls)
+                else:
+                    el = soup.find(sel.lstrip(".")) if sel.startswith(".") else soup.find(sel)
+                if el and el.get_text(strip=True):
+                    title = el.get_text(strip=True)
+                    if len(title) > 10:
+                        break
+            except Exception:
+                continue
+
+        author = ""
+        author_el = soup.find(class_=re.compile(r"com-author-name|article-author|author", re.I))
+        if author_el:
+            author = author_el.get_text(strip=True)
+        if not author:
+            meta_author = soup.find("meta", attrs={"name": "author"})
+            if meta_author:
+                author = (meta_author.get("content") or "").strip()
+
+        publish_time = ""
+        head = soup.find(class_=re.compile(r"article-widget-head", re.I))
+        if head:
+            time_text = head.get_text(" ", strip=True)
+            match = re.search(r"(20\d{2}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)", time_text)
+            if match:
+                publish_time = match.group(1)
+        if not publish_time:
+            for sel in ["time", ".publish-time", ".date", ".article-date"]:
+                el = soup.find("time") if sel == "time" else soup.find(class_=sel.lstrip("."))
+                if el:
+                    publish_time = el.get_text(strip=True)
+                    if publish_time:
+                        break
+        return title, author, publish_time
+
+    def _find_content_area(self, soup: BeautifulSoup):
+        for pattern in [
+            re.compile(r"content-main", re.I),
+            re.compile(r"content-layout", re.I),
+            re.compile(r"article-content", re.I),
+            re.compile(r"article-main", re.I),
+        ]:
+            node = soup.find(class_=pattern)
+            if not node:
+                continue
+            content_area = node.find("article") or node
+            text = content_area.get_text(strip=True)
+            if len(text) > 200:
+                return content_area
+
+        for sel in [
+            ".article-content-wrap",
+            ".article-main",
+            ".content-main",
+            ".article-content-layout",
+            "article",
+            ".content",
+            "main",
+        ]:
+            if " " in sel:
+                parts = sel.split()
+                parent = soup.find(class_=parts[0].lstrip(".")) if parts[0].startswith(".") else soup.find(parts[0])
+                node = parent.find(class_=parts[1].lstrip(".")) if parent and parts[1].startswith(".") else (parent.find(parts[1]) if parent else None)
+            else:
+                node = soup.find(class_=sel.lstrip(".")) if sel.startswith(".") else soup.find(sel)
+            if node:
+                content_area = node.find("article") or node
+                text = content_area.get_text(strip=True)
+                if len(text) > 200:
+                    return content_area
+
+        for div in soup.find_all(["article", "div", "section", "main"]):
+            text = div.get_text(strip=True)
+            if len(text) > 500 and div.find("p") and any(c in text for c in ["。", "，", "的"]):
+                return div
+        return None
+
+    def _parse_article_content(self, content_area) -> Tuple[str, List[Dict]]:
+        paragraphs: List[str] = []
+        images: List[Dict] = []
+        processed_imgs = set()
+
+        def process(el):
+            if el.name == "img":
+                src = el.get("src") or el.get("data-src") or el.get("data-original")
+                if src and not src.startswith("data:") and src not in processed_imgs:
+                    local = self._download_image(src)
+                    if local:
+                        alt = el.get("alt") or el.get("title") or "图片"
+                        images.append({"original": src, "local": local, "alt": alt})
+                        processed_imgs.add(src)
+                        paragraphs.append(f"\n![[{local}|{alt}]]\n")
+                return
+            if el.name in ["p", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "code", "blockquote", "li"]:
+                for c in getattr(el, "children", []):
+                    if getattr(c, "name", None) == "img":
+                        process(c)
+                copy = BeautifulSoup(str(el), "html.parser")
+                for img in copy.find_all("img"):
+                    img.decompose()
+                text = copy.get_text(" ", strip=True)
+                if not text or len(text) < 2:
+                    return
+                if el.name == "p":
+                    paragraphs.append(text)
+                elif el.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+                    lv = int(el.name[1])
+                    paragraphs.append(f"\n{'#' * lv} {text}\n")
+                elif el.name in ["pre", "code"]:
+                    paragraphs.append(f"\n```\n{text}\n```\n")
+                elif el.name == "blockquote":
+                    paragraphs.append(f"> {text}")
+                elif el.name == "li":
+                    paragraphs.append(f"- {text}")
+                return
+            if el.name in ["div", "section", "article", "main", "ul", "ol", "figure"]:
+                for c in getattr(el, "children", []):
+                    if getattr(c, "name", None):
+                        process(c)
+
+        for child in getattr(content_area, "children", []):
+            if getattr(child, "name", None):
+                process(child)
+
+        paragraphs = self._trim_leading_noise(paragraphs)
+        paragraphs = self._drop_noise_paragraphs(paragraphs)
+        paragraphs, images = self._trim_trailing_ads(paragraphs, images)
+        return "\n\n".join(paragraphs), images
+
+    def _extract_article_from_soup(self, soup: BeautifulSoup, article_url: str, list_title: str = "") -> Optional[Dict]:
+        title, author, publish_time = self._extract_article_meta(soup)
+        if not title and list_title:
+            title = list_title
+        if not title:
+            title = "未命名"
+
+        content_area = self._find_content_area(soup)
+        if not content_area:
+            logger.warning("未找到正文区域: %s", article_url)
             return None
+
+        for unwanted in content_area.find_all(class_=lambda x: x and any(
+            kw in str(x).lower() for kw in ["ad", "comment", "share", "sidebar", "related", "recommend", "hot"]
+        )):
+            unwanted.decompose()
+        self._remove_article_ads(content_area)
+
+        content, images = self._parse_article_content(content_area)
+        if not content.strip():
+            logger.warning("正文解析为空: %s", article_url)
+            return None
+
+        return {
+            "title": title,
+            "content": content,
+            "images": images,
+            "author": author,
+            "publish_time": publish_time,
+            "url": article_url,
+        }
+
+    def _fetch_article_detail_via_requests(self, article_url: str, list_title: str = "") -> Optional[Dict]:
+        if self._article_request_blocked:
+            return None
+        try:
+            if not self._landing_primed:
+                self._prime_weekly_session()
+            resp = self.session.get(
+                article_url,
+                headers={"Referer": self.LANDING_URL, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"},
+                timeout=self._request_timeout,
+            )
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            return self._extract_article_from_soup(soup, article_url, list_title=list_title)
+        except requests.HTTPError as e:
+            status_code = getattr(e.response, "status_code", None)
+            if status_code == 403:
+                self._article_request_blocked = True
+                logger.warning("articles requests 被 403 阻断，后续本次运行改走 Selenium: %s", article_url)
+            else:
+                logger.warning("requests 解析文章失败 %s: %s", article_url, e)
+            return None
+        except Exception as e:
+            logger.warning("requests 解析文章失败 %s: %s", article_url, e)
+            return None
+
+    def _fetch_article_detail_via_selenium(self, article_url: str, list_title: str = "") -> Optional[Dict]:
         self._init_driver()
         try:
             self.driver.get(article_url)
             time.sleep(3)
             try:
                 WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "article-content-layout"))
+                    EC.presence_of_element_located((By.TAG_NAME, "h1"))
                 )
-                time.sleep(2)
+                time.sleep(1)
             except TimeoutException:
-                try:
-                    WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_element_located((By.TAG_NAME, "body"))
-                    )
-                    time.sleep(2)
-                except TimeoutException:
-                    logger.warning("页面加载超时: %s", article_url)
-                    return None
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
             soup = BeautifulSoup(self.driver.page_source, "html.parser")
-            title = ""
-            for sel in ["h1.article-title", "h1", ".article-title"]:
-                try:
-                    if " " in sel:
-                        tag, cls = sel.split(".", 1)
-                        el = soup.find(tag, class_=cls)
-                    else:
-                        el = soup.find(sel.lstrip(".")) if sel.startswith(".") else soup.find(sel)
-                    if el and el.get_text(strip=True):
-                        title = el.get_text(strip=True)
-                        if len(title) > 10:
-                            break
-                except Exception:
-                    continue
-            if not title and list_title:
-                title = list_title
-            if not title:
-                title = "未命名"
-
-            content_area = None
-            for sel in [
-                ".article-content-wrap",
-                ".article-main",
-                ".content-main",
-                ".article-content-layout",
-                "article",
-                ".content",
-                "main",
-            ]:
-                if " " in sel:
-                    parts = sel.split()
-                    parent = soup.find(class_=parts[0].lstrip(".")) if parts[0].startswith(".") else soup.find(parts[0])
-                    content_area = parent.find(class_=parts[1].lstrip(".")) if parent and parts[1].startswith(".") else (parent.find(parts[1]) if parent else None)
-                else:
-                    content_area = soup.find(class_=sel.lstrip(".")) if sel.startswith(".") else soup.find(sel)
-                if content_area:
-                    text = content_area.get_text(strip=True)
-                    if len(text) > 500 and any(c in text for c in ["。", "，", "的", "是"]):
-                        break
-                    content_area = None
-            if not content_area:
-                for div in soup.find_all("div"):
-                    text = div.get_text(strip=True)
-                    if len(text) > 500 and div.find("p") and any(c in text for c in ["。", "，", "的"]):
-                        content_area = div
-                        break
-            if not content_area:
-                logger.warning("未找到正文区域: %s", article_url)
-                return None
-
-            for unwanted in content_area.find_all(class_=lambda x: x and any(
-                kw in str(x).lower() for kw in ["ad", "comment", "share", "sidebar", "related", "recommend", "hot"]
-            )):
-                unwanted.decompose()
-            self._remove_article_ads(content_area)
-
-            paragraphs = []
-            images = []
-            processed_imgs = set()
-
-            def process(el):
-                if el.name == "img":
-                    src = el.get("src") or el.get("data-src") or el.get("data-original")
-                    if src and not src.startswith("data:") and src not in processed_imgs:
-                        local = self._download_image(src)
-                        if local:
-                            alt = el.get("alt") or el.get("title") or "图片"
-                            images.append({"original": src, "local": local, "alt": alt})
-                            processed_imgs.add(src)
-                            paragraphs.append(f"\n![[{local}|{alt}]]\n")
-                    return
-                if el.name in ["p", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "code", "blockquote", "li"]:
-                    for c in getattr(el, "children", []):
-                        if getattr(c, "name", None) == "img":
-                            process(c)
-                    copy = BeautifulSoup(str(el), "html.parser")
-                    for img in copy.find_all("img"):
-                        img.decompose()
-                    text = copy.get_text(strip=True)
-                    if not text or len(text) < 3:
-                        return
-                    if el.name == "p":
-                        paragraphs.append(text)
-                    elif el.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-                        lv = int(el.name[1])
-                        paragraphs.append(f"\n{'#' * lv} {text}\n")
-                    elif el.name in ["pre", "code"]:
-                        paragraphs.append(f"\n```\n{text}\n```\n")
-                    elif el.name == "blockquote":
-                        paragraphs.append(f"> {text}")
-                    elif el.name == "li":
-                        paragraphs.append(f"- {text}")
-                    return
-                if el.name in ["div", "section", "article", "main", "ul", "ol"]:
-                    for c in getattr(el, "children", []):
-                        if getattr(c, "name", None):
-                            process(c)
-
-            for child in getattr(content_area, "children", []):
-                if getattr(child, "name", None):
-                    process(child)
-
-            paragraphs, images = self._trim_trailing_ads(paragraphs, images)
-
-            author = ""
-            for sel in [".author", ".writer", ".by", ".article-author"]:
-                el = soup.find(class_=sel.lstrip("."))
-                if el:
-                    author = el.get_text(strip=True)
-                    break
-            publish_time = ""
-            for sel in ["time", ".publish-time", ".date", ".article-date"]:
-                el = soup.find("time") if sel == "time" else soup.find(class_=sel.lstrip("."))
-                if el:
-                    publish_time = el.get_text(strip=True)
-                    break
-
-            return {
-                "title": title,
-                "content": "\n\n".join(paragraphs),
-                "images": images,
-                "author": author,
-                "publish_time": publish_time,
-                "url": article_url,
-            }
+            return self._extract_article_from_soup(soup, article_url, list_title=list_title)
         except Exception as e:
-            logger.warning("获取文章详情失败 %s: %s", article_url, e)
+            logger.warning("selenium 解析文章失败 %s: %s", article_url, e)
             return None
+
+    def fetch_article_detail(self, article_url: str, weekly_id: str, list_title: str = "") -> Optional[Dict]:
+        """
+        优先用 requests 解析文章详情，失败时回退到 Selenium。
+        正文区域去广告、裁剪前后噪声；图片下载到 current_weekly_dir/attachments/。
+        返回 {"title","content","images","author","publish_time","url"}，失败返回 None。
+        """
+        if not article_url:
+            return None
+        detail = self._fetch_article_detail_via_requests(article_url, list_title=list_title)
+        if detail:
+            return detail
+        detail = self._fetch_article_detail_via_selenium(article_url, list_title=list_title)
+        if detail:
+            return detail
+        logger.warning("获取文章详情失败 %s", article_url)
+        return None
 
     # ---------- 6. 保存单篇文章与索引 ----------
     def _article_filename(self, article: Dict, index: int) -> str:
@@ -743,18 +938,30 @@ class InfoQWeeklyCrawler:
         """
         同步一期：获取该期文章列表；每篇检查本地是否已下载，未下载则抓取；最后写 00-index.md。
         """
-        # 通过 getPaperList 无法单独按期过滤，只能依靠已有本地精要 HTML 或手动提供 edm_url；
-        # 这里沿用原有行为：仅使用本地「每周精要」HTML。
-        return self._sync_one_week(issue_id, date_str, from_api_articles=None, edm_url=None, force=force)
+        weekly_list = self.fetch_weekly_list_from_api(size=max(self._api_size, 20))
+        target = next((item for item in weekly_list if str(item.get("id")) == str(issue_id)), None)
+        edm_url = None
+        from_api_articles = None
+        resolved_date = date_str
+        if target:
+            edm_url = target.get("edm_url")
+            from_api_articles = target.get("articles")
+            resolved_date = resolved_date or target.get("date")
+        return self._sync_one_week(
+            issue_id,
+            resolved_date,
+            from_api_articles=from_api_articles,
+            edm_url=edm_url,
+            force=force,
+        )
 
-    # ---------- 8. 一次请求 100 期列表，按周建目录并逐篇检查是否已下载 ----------
+    # ---------- 8. 一次请求多期列表，按周建目录并逐篇检查是否已下载 ----------
     def sync_all(self, size: Optional[int] = None, force: bool = False) -> List[Path]:
         """
-        请求周刊列表 API（payload size=100），按周处理：
+        无参数时默认尽量请求全部可爬历史；显式传 size 时按指定数量请求周刊列表 API。
         目录名 周刊_{number}_{yyyy-mm-dd}；每期文章列表中未下载的才抓取。
         """
-        size = size if size is not None else self._api_size
-        weekly_list = self.fetch_weekly_list_from_api(size=size)
+        weekly_list = self.fetch_weekly_list_from_api(size=size) if size is not None else self.fetch_all_weekly_list_from_api()
         if not weekly_list:
             logger.info("API 未返回列表，改为从 landing 页抓取往期列表: %s", self.LANDING_URL)
             weekly_list = self.fetch_weekly_list_from_landing_page()
@@ -807,7 +1014,7 @@ class InfoQWeeklyCrawler:
             title_from_list = link.get("title", "")
             if not url:
                 continue
-            if self.is_article_downloaded(issue_id, url):
+            if (not force) and self.is_article_downloaded(issue_id, url):
                 logger.info("跳过已下载: %s", url[:60])
                 articles.append({"title": title_from_list or f"文章{i}", "url": url, "content": "", "images": [], "author": "", "publish_time": ""})
                 continue

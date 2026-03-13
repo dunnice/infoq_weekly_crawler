@@ -13,6 +13,12 @@ INFOQ_WEEKLY_URL = "https://www.infoq.cn/weekly/landing"
 # 请求间隔时间（秒），避免请求过快
 REQUEST_DELAY = 2
 
+# getPaperList 每次拉取的周刊数量
+WEEKLY_LIST_PAYLOAD_SIZE = 20
+
+# 默认批量同步时，向上探测 getPaperList 的最大 size
+WEEKLY_LIST_MAX_PAYLOAD_SIZE = 1000
+
 # 每次爬取的周刊数量（默认只爬取最新一期）
 DEFAULT_CRAWL_COUNT = 1
 
