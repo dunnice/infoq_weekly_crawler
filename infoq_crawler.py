@@ -7,7 +7,7 @@ InfoQ 周刊爬虫
 1. 通过 API 一次请求获取多期周刊列表：先访问 weekly/landing 预热会话，再 POST getPaperList，payload={"size":20}。
 2. 按周处理：目录名为 周刊_{周刊number}_{周刊时间转为 yyyy-mm-dd}。
 3. 每期：获取该期文章列表，检查每篇文章本地是否已下载（按 URL 记录）；未下载则抓取正文与图片并保存。
-4. 入口：无参数 = 拉取 100 期列表并逐期同步；指定期号 = 只同步该期（需能拿到该期文章列表）。
+4. 入口：无参数 = 拉取历史 100 期列表并逐期同步；指定期号 = 只同步该期（需能拿到该期文章列表）。
 """
 
 import os
@@ -248,7 +248,7 @@ class InfoQWeeklyCrawler:
         """
         tried_sizes = []
         candidate_sizes = sorted({
-            max(20, self._api_size),
+            max(100, self._api_size),
             100,
             300,
             500,
@@ -938,7 +938,7 @@ class InfoQWeeklyCrawler:
         """
         同步一期：获取该期文章列表；每篇检查本地是否已下载，未下载则抓取；最后写 00-index.md。
         """
-        weekly_list = self.fetch_weekly_list_from_api(size=max(self._api_size, 20))
+        weekly_list = self.fetch_weekly_list_from_api(size=max(self._api_size, 100))
         target = next((item for item in weekly_list if str(item.get("id")) == str(issue_id)), None)
         edm_url = None
         from_api_articles = None
@@ -958,10 +958,15 @@ class InfoQWeeklyCrawler:
     # ---------- 8. 一次请求多期列表，按周建目录并逐篇检查是否已下载 ----------
     def sync_all(self, size: Optional[int] = None, force: bool = False) -> List[Path]:
         """
-        无参数时默认尽量请求全部可爬历史；显式传 size 时按指定数量请求周刊列表 API。
+        无参数时默认拉取历史 100 期；显式传 size 时按指定数量请求周刊列表 API。
         目录名 周刊_{number}_{yyyy-mm-dd}；每期文章列表中未下载的才抓取。
         """
-        weekly_list = self.fetch_weekly_list_from_api(size=size) if size is not None else self.fetch_all_weekly_list_from_api()
+        default_weeks = 50
+        req_size = size if size is not None else default_weeks
+        weekly_list = self.fetch_weekly_list_from_api(size=req_size)
+        # 注：getPaperList 接口服务端可能限制最多返回 20 期，无法通过 size 突破
+        if len(weekly_list) < req_size:
+            logger.info("API 返回 %s 期（目标 %s 期，服务端可能限制为 20）", len(weekly_list), req_size)
         if not weekly_list:
             logger.info("API 未返回列表，改为从 landing 页抓取往期列表: %s", self.LANDING_URL)
             weekly_list = self.fetch_weekly_list_from_landing_page()
@@ -1061,7 +1066,7 @@ def main():
             issue_id = sys.argv[1].strip()
             crawler.sync_issue(issue_id, force=True)
         else:
-            crawler.sync_all(force=False)
+            crawler.sync_all(size=50, force=False)
     finally:
         crawler.close()
 

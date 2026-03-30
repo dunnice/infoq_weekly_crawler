@@ -68,3 +68,5 @@ tests/output/
 *.tmp
 *.bak
 *.swp
+
+.tmp_output/
